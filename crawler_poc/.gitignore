@@ -211,3 +211,6 @@ __marimo__/
 
 # HTML files
 *.html
+
+# sqlite db
+*.db
