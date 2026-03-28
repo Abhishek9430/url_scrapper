@@ -66,6 +66,28 @@ Check result:
 curl http://localhost:5000/crawl/<job_id>
 ```
 
+## Demo runbook
+
+1. Start services (Redis, HTTP worker, render worker, API) as shown in `Local setup`.
+2. Submit a normal crawl request (`http://example.com`) and verify `status=COMPLETED`.
+3. Submit a known protected URL (for example REI blog sample) and verify `status=BLOCKED`.
+4. Submit a render request with `force_render=true` for an allowlisted domain and verify render-tier handling.
+5. Check counters in `GET /metrics` to confirm completed/blocked/escalated paths are tracked.
+
+## Expected status examples
+
+- `COMPLETED` example:
+  - `http_status=200`
+  - parsed fields in `result` (`title`, `body_text`, `topics`, etc.)
+  - `error_message=null`
+- `BLOCKED` example:
+  - `error_reason_code=BLOCKED_CHALLENGE_PAGE` (or policy code)
+  - challenge/access-denied snapshot saved in `result`
+  - raw HTML path available for debugging
+- `FAILED` example:
+  - retry exhaustion or runtime/render timeout
+  - `error_reason_code` reflects failure cause
+
 ## Notes
 
 - SQLite DB path: `data/crawler.db`
@@ -77,6 +99,13 @@ curl http://localhost:5000/crawl/<job_id>
 - Challenge/blocked pages (e.g., 403 + access-denied markers) are marked `BLOCKED`, not `COMPLETED`.
 - Status values include: `QUEUED`, `RUNNING`, `ESCALATED_RENDER`, `COMPLETED`, `BLOCKED`, `FAILED`.
 - Job errors are standardized as `REASON_CODE: message` and exposed in API as `error_reason_code` and `error_reason_message`.
+
+## Known limitations
+
+- Anti-bot protected domains may still be blocked in both HTTP and render tiers.
+- Topic classification is intentionally lightweight (keyword-based) for PoC only.
+- SQLite is suitable for PoC but should be replaced with managed production storage for scale.
+- Render tier currently supports compliant JS rendering, not anti-bot bypass behavior.
 
 ## Tiered policy environment variables
 
