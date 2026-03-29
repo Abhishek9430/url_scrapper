@@ -4,10 +4,13 @@ from flask import Flask, jsonify, request
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
+import app.env  # noqa: F401
 from app.db import get_connection, init_db
+from app.metrics import snapshot as metrics_snapshot
 from app.jobs import create_job, update_job
-from app.tasks import crawl_url_task
-from app.utils import is_valid_url
+from app.policy import decide_initial_tier
+from app.tasks import crawl_http_task, crawl_render_task
+from app.utils import is_valid_url, utc_now
 
 
 app = Flask(__name__)
@@ -43,14 +46,37 @@ def health() -> tuple[dict, int]:
 def submit_crawl():
     payload = request.get_json(silent=True) or {}
     url = payload.get("url")
+    force_render = bool(payload.get("force_render", False))
     if not isinstance(url, str) or not url.strip():
         return error_response("INVALID_REQUEST", "Field 'url' is required.", 400)
     if not is_valid_url(url):
         return error_response("INVALID_URL", "Invalid URL. Use http/https URL.", 400)
 
-    job_id = create_job(url.strip())
+    normalized_url = url.strip()
+    job_id = create_job(normalized_url)
+    initial_tier, tier_reason = decide_initial_tier(normalized_url, force_render=force_render)
+    if initial_tier == "blocked":
+        update_job(
+            job_id,
+            status="BLOCKED",
+            finished_at=utc_now(),
+            error_message=f"{tier_reason}: Request blocked by routing policy.",
+        )
+        return (
+            jsonify(
+                {
+                    "job_id": job_id,
+                    "status": "BLOCKED",
+                    "status_url": f"/crawl/{job_id}",
+                }
+            ),
+            202,
+        )
     try:
-        crawl_url_task.delay(job_id, url.strip())
+        if initial_tier == "render":
+            crawl_render_task.delay(job_id, normalized_url, "FORCE_RENDER_REQUESTED")
+        else:
+            crawl_http_task.delay(job_id, normalized_url)
     except Exception as exc:
         update_job(job_id, status="FAILED", error_message=f"QUEUE_UNAVAILABLE: {exc}")
         return error_response(
@@ -90,8 +116,21 @@ def submit_batch_crawl():
             rejected.append({"url": item, "reason": "INVALID_URL"})
             continue
         job_id = create_job(item.strip())
+        initial_tier, tier_reason = decide_initial_tier(item.strip(), force_render=False)
+        if initial_tier == "blocked":
+            update_job(
+                job_id,
+                status="BLOCKED",
+                finished_at=utc_now(),
+                error_message=f"{tier_reason}: Request blocked by routing policy.",
+            )
+            rejected.append({"url": item, "reason": tier_reason})
+            continue
         try:
-            crawl_url_task.delay(job_id, item.strip())
+            if initial_tier == "render":
+                crawl_render_task.delay(job_id, item.strip(), "ALLOWLIST_ROUTED_RENDER")
+            else:
+                crawl_http_task.delay(job_id, item.strip())
             created.append({"job_id": job_id, "url": item.strip(), "status": "QUEUED"})
         except Exception:
             update_job(
@@ -131,6 +170,12 @@ def get_crawl_result(job_id: str):
         ).fetchone()
 
     response = dict(job)
+    reason_parts = (response.get("error_message") or "").split(":", 1)
+    if response.get("error_message") and reason_parts:
+        response["error_reason_code"] = reason_parts[0].strip()
+        response["error_reason_message"] = (
+            reason_parts[1].strip() if len(reason_parts) > 1 else response["error_message"]
+        )
     if result:
         result_dict = dict(result)
         result_dict["topics"] = json.loads(result_dict.pop("topics_json") or "[]")
@@ -172,6 +217,11 @@ def list_crawls():
         rows = conn.execute(query, params).fetchall()
 
     return jsonify({"items": [dict(row) for row in rows], "limit": limit, "offset": offset}), 200
+
+
+@app.get("/metrics")
+def metrics():
+    return jsonify(metrics_snapshot()), 200
 
 
 if __name__ == "__main__":
